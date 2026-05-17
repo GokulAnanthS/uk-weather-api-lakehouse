@@ -1,0 +1,5 @@
+requests
+kafka-python
+boto3
+python-dotenv
+tenacity
