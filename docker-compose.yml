@@ -11,6 +11,13 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - lakehouse
 
   minio:
     image: minio/minio
@@ -24,6 +31,21 @@ services:
       - "9001:9001"
     volumes:
       - ./data/minio:/data
+    networks:
+      - lakehouse
+  minio-init:
+    image: minio/mc
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set myminio http://minio:9000 admin password) do echo 'Waiting for MinIO...' && sleep 2; done;
+      /usr/bin/mc mb myminio/warehouse || true;
+      exit 0;
+      "
+    networks:
+      - lakehouse
 
   spark-master:
     image: apache/spark:3.5.1
@@ -33,6 +55,8 @@ services:
     ports:
       - "7077:7077"
       - "8080:8080"
+    networks:
+      - lakehouse
     volumes:
       - ./spark/jobs:/opt/spark/jobs
       - ./data/raw:/opt/spark/data
@@ -48,6 +72,8 @@ services:
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
+    networks:
+      - lakehouse
     volumes:
       - ./spark/jobs:/opt/spark/jobs
       - ./data/raw:/opt/spark/data
@@ -76,6 +102,8 @@ services:
       - ./ivy:/root/.ivy2
     ports:
       - "8081:8080"
+    networks:
+      - lakehouse
 
   airflow-scheduler:
     build:
@@ -97,19 +125,43 @@ services:
       - ./spark/jobs:/opt/spark/jobs
       - ./data/raw:/opt/spark/data
       - ./ivy:/root/.ivy2
+    networks:
+      - lakehouse
 
   iceberg-rest:
     image: tabulario/iceberg-rest
     container_name: iceberg-rest
     ports:
       - "8181:8181"
+
     environment:
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+
+      # PostgreSQL catalog
+      CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg_catalog
+      CATALOG_JDBC_USER: airflow
+      CATALOG_JDBC_PASSWORD: airflow
+
+      # Warehouse
       CATALOG_WAREHOUSE: s3://warehouse/
+
+      # MinIO
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: admin
-      AWS_SECRET_ACCESS_KEY: password123
+      AWS_SECRET_ACCESS_KEY: password
       AWS_REGION: us-east-1
+
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+    networks:
+      - lakehouse
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -121,6 +173,8 @@ services:
       - "2181:2181"
     volumes:
        - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - lakehouse
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -143,6 +197,8 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    networks:
+      - lakehouse
     volumes:
        - kafka_data:/var/lib/kafka/data
 
@@ -158,9 +214,28 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       # Optional but useful:
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - lakehouse
+  trino:
+    image: trinodb/trino:443
+    container_name: trino
+    ports:
+      - "8083:8080"
+    depends_on:
+      - iceberg-rest
+      - minio
+    volumes:
+      - ./trino:/etc/trino
+    networks:
+      - lakehouse
+
 
       
 volumes:
   postgres_data:
   kafka_data:
   zookeeper_data:
+
+networks:
+  lakehouse:
+    driver: bridge
